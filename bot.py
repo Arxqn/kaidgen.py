@@ -132,7 +132,7 @@ server_bot_config = {}
 server_free_cooldowns = {}
 server_prem_cooldowns = {}
 
-# Default config
+# Default config (UPDATED with auto_give_free_role_on_join)
 DEFAULT_CONFIG = {
     "free_gen_role_name": "free gen",
     "prem_gen_role_name": "prem gen",
@@ -141,7 +141,8 @@ DEFAULT_CONFIG = {
     "invite_age_required_days": 7,
     "invite_reward_duration": "24",
     "default_free_cooldown": 30,
-    "default_prem_cooldown": 30
+    "default_prem_cooldown": 30,
+    "auto_give_free_role_on_join": True  # NEW: Auto-give role when invites_required = 0
 }
 
 # ============================================
@@ -403,6 +404,11 @@ async def check_invite_age(member):
     account_age = time.time() - member.created_at.timestamp()
     return account_age >= (age_days * 24 * 60 * 60)
 
+async def get_age_required(guild_id):
+    """Get the required account age in days for a server"""
+    config = get_server_config(guild_id)
+    return config.get("invite_age_required_days", 7)
+
 def create_premium_key_for_user(guild_id, hours, user_id):
     key = generate_key()
     expiry = get_expiry_timestamp(hours)
@@ -461,7 +467,7 @@ async def on_ready():
     print(f"[READY] All data loaded for {len(bot.guilds)} servers!")
 
 # ============================================
-# INVITE SYSTEM
+# INVITE SYSTEM (UPDATED with auto-give on 0 invites)
 # ============================================
 
 @bot.event
@@ -471,44 +477,108 @@ async def on_member_join(member):
     await bot.wait_until_ready()
     await asyncio.sleep(2)
     
+    config = get_server_config(guild_id)
+    free_role_invites = config.get("free_role_invites_required", 1)
+    auto_give_role = config.get("auto_give_free_role_on_join", True)
+    
+    # NEW: If invites_required is 0 AND auto_give_role is True, give role automatically
+    if free_role_invites == 0 and auto_give_role:
+        role_name = config.get("free_gen_role_name", "free gen")
+        role = discord.utils.get(guild.roles, name=role_name)
+        
+        if role:
+            await member.add_roles(role)
+            print(f"[AUTO-ROLE] Gave {role_name} role to {member.name} (invites_required=0)")
+            # Optionally DM the user
+            try:
+                dm_embed = discord.Embed(
+                    title="🎉 Welcome!",
+                    description=f"You've automatically received the `{role_name}` role because the server has invite requirement set to 0!",
+                    color=discord.Color.dark_gray()
+                )
+                dm_embed.set_footer(text="made by Arxqn")
+                await member.send(embed=dm_embed)
+            except:
+                pass
+        setattr(bot, f"invite_cache_{guild_id}", await guild.invites())
+        return
+    
+    # Get current invites (only if invites_required > 0)
     new_invites = await guild.invites()
     old_invites = getattr(bot, f"invite_cache_{guild_id}", [])
     
+    # Check account age FIRST (before counting)
+    if not await check_invite_age(member):
+        print(f"[INVITE] {member.name} joined but account under {await get_age_required(guild_id)} days old - not counted")
+        setattr(bot, f"invite_cache_{guild_id}", new_invites)
+        return
+    
+    # Find which invite was used
     for invite in new_invites:
         old_invite = discord.utils.get(old_invites, code=invite.code)
         if old_invite and invite.uses > old_invite.uses:
             inviter = invite.inviter
-            if inviter:
-                if not await check_invite_age(member):
-                    break
-                
+            if inviter and not inviter.bot:
                 inviter_id = str(inviter.id)
+                
+                # Load current data
                 invite_data = get_server_invite_data(guild_id)
-                invite_data[inviter_id] = invite_data.get(inviter_id, 0) + 1
+                current_count = invite_data.get(inviter_id, 0)
+                
+                # Store invited user info for leave tracking
+                if "invited_users" not in invite_data:
+                    invite_data["invited_users"] = {}
+                if "user_inviter_map" not in invite_data:
+                    invite_data["user_inviter_map"] = {}
+                
+                # Record who invited this user
+                invite_data["invited_users"][str(member.id)] = {
+                    "inviter_id": inviter_id,
+                    "joined_at": time.time(),
+                    "account_age_when_joined": member.created_at.timestamp()
+                }
+                invite_data["user_inviter_map"][str(member.id)] = inviter_id
+                
+                # Increment invite count
+                new_count = current_count + 1
+                invite_data[inviter_id] = new_count
                 server_invite_data[guild_id] = invite_data
                 save_server_invites(guild_id)
                 
-                config = get_server_config(guild_id)
+                print(f"[INVITE] {inviter.name} now has {new_count} valid invites (+1 from {member.name})")
                 
-                # Check for free gen role
-                free_role_invites = config.get("free_role_invites_required", 1)
-                role_name = config.get("free_gen_role_name", "free gen")
-                role = discord.utils.get(guild.roles, name=role_name)
-                if role and invite_data[inviter_id] >= free_role_invites:
-                    member_to_role = guild.get_member(int(inviter_id))
-                    if member_to_role and role not in member_to_role.roles:
-                        await member_to_role.add_roles(role)
-                        print(f"[INVITE] Gave {role_name} role to {member_to_role.name} for {invite_data[inviter_id]} invites")
+                # Check for free gen role (only if invites_required > 0)
+                if free_role_invites > 0:
+                    role_name = config.get("free_gen_role_name", "free gen")
+                    role = discord.utils.get(guild.roles, name=role_name)
+                    
+                    if role and new_count >= free_role_invites:
+                        member_to_role = guild.get_member(int(inviter_id))
+                        if member_to_role and role not in member_to_role.roles:
+                            await member_to_role.add_roles(role)
+                            print(f"[INVITE] Gave {role_name} role to {member_to_role.name}")
+                            
+                            try:
+                                dm_embed = discord.Embed(
+                                    title="🎉 You earned the Free Gen role!",
+                                    description=f"You now have the `{role_name}` role with {new_count} valid invites!",
+                                    color=discord.Color.dark_gray()
+                                )
+                                dm_embed.set_footer(text="made by Arxqn")
+                                await member_to_role.send(embed=dm_embed)
+                            except:
+                                pass
                 
                 # Check for premium key reward
                 reward_count = config.get("invite_reward_count", 5)
-                if invite_data[inviter_id] >= reward_count:
+                if new_count >= reward_count:
                     if not invite_data.get(f"{inviter_id}_rewarded", False):
                         reward_hours = int(config.get("invite_reward_duration", "24"))
                         key = create_premium_key_for_user(guild_id, reward_hours, inviter.id)
                         invite_data[f"{inviter_id}_rewarded"] = True
                         server_invite_data[guild_id] = invite_data
                         save_server_invites(guild_id)
+                        
                         try:
                             dm_embed = discord.Embed(
                                 title=f"🎉 You reached {reward_count} invites!",
@@ -517,12 +587,79 @@ async def on_member_join(member):
                             )
                             dm_embed.set_footer(text="made by Arxqn")
                             await inviter.send(embed=dm_embed)
-                            print(f"[INVITE] Sent premium key to {inviter.name} for {reward_count} invites")
+                            print(f"[INVITE] Sent premium key to {inviter.name}")
                         except:
                             pass
                 break
     
+    # Update cache
     setattr(bot, f"invite_cache_{guild_id}", new_invites)
+
+@bot.event
+async def on_member_remove(member):
+    """When someone leaves, remove that invite from the inviter's count"""
+    guild = member.guild
+    guild_id = str(guild.id)
+    
+    config = get_server_config(guild_id)
+    free_role_invites = config.get("free_role_invites_required", 1)
+    
+    # If invites_required is 0, we don't track invites at all
+    if free_role_invites == 0:
+        return
+    
+    # Load invite data
+    invite_data = get_server_invite_data(guild_id)
+    
+    # Check if this user was invited by someone
+    user_id_str = str(member.id)
+    
+    if "user_inviter_map" in invite_data and user_id_str in invite_data["user_inviter_map"]:
+        inviter_id = invite_data["user_inviter_map"][user_id_str]
+        
+        # Check if user joined with account age requirement
+        user_join_info = invite_data.get("invited_users", {}).get(user_id_str, {})
+        account_age_when_joined = user_join_info.get("account_age_when_joined", 0)
+        current_time = time.time()
+        age_required_seconds = (await get_age_required(guild_id)) * 24 * 60 * 60
+        
+        # Only remove if the account was old enough when they joined (was counted)
+        if (current_time - account_age_when_joined) >= 0:  # They were counted originally
+            current_count = invite_data.get(inviter_id, 0)
+            new_count = max(0, current_count - 1)
+            invite_data[inviter_id] = new_count
+            
+            # Remove from tracking maps
+            del invite_data["user_inviter_map"][user_id_str]
+            if "invited_users" in invite_data and user_id_str in invite_data["invited_users"]:
+                del invite_data["invited_users"][user_id_str]
+            
+            server_invite_data[guild_id] = invite_data
+            save_server_invites(guild_id)
+            
+            print(f"[LEAVE] {member.name} left. {inviter_id} lost 1 invite. New count: {new_count}")
+            
+            # Check if they should lose the free gen role (only if invites_required > 0)
+            if free_role_invites > 0:
+                role_name = config.get("free_gen_role_name", "free gen")
+                role = discord.utils.get(guild.roles, name=role_name)
+                
+                if role and new_count < free_role_invites:
+                    inviter_member = guild.get_member(int(inviter_id))
+                    if inviter_member and role in inviter_member.roles:
+                        await inviter_member.remove_roles(role)
+                        print(f"[LEAVE] Removed {role_name} role from {inviter_member.name} (now has {new_count} invites)")
+                        
+                        try:
+                            dm_embed = discord.Embed(
+                                title="⚠️ Free Gen Role Removed",
+                                description=f"You no longer have the `{role_name}` role because your valid invites dropped to {new_count} (need {free_role_invites})",
+                                color=discord.Color.dark_orange()
+                            )
+                            dm_embed.set_footer(text="made by Arxqn")
+                            await inviter_member.send(embed=dm_embed)
+                        except:
+                            pass
 
 async def check_expired_premium():
     await bot.wait_until_ready()
@@ -598,7 +735,7 @@ async def setup(interaction: discord.Interaction, ticket_channel: discord.TextCh
     confirm = discord.Embed(title="✅ Setup Complete", color=discord.Color.dark_gray())
     confirm.add_field(name="Created", value=f"Category: **Gen**\n{free_ch.mention} - Free gen channel\n{prem_ch.mention} - Premium gen channel", inline=False)
     confirm.add_field(name="Roles Created", value=f"{free_role.mention}\n{prem_role.mention}", inline=False)
-    confirm.add_field(name="ℹ️ Commands", value="• `/gen free/prem` - Generate accounts\n• `/stockcount` - Check stock\n• `/redeemkey` - Activate premium keys\n• `/getinvite` - Get invite link\n• `/checkinvites` - Claim free gen role and check progress\n• `/config` - Open config menu", inline=False)
+    confirm.add_field(name="ℹ️ Commands", value="• `/gen free/prem` - Generate accounts\n• `/stockcount` - Check stock\n• `/redeemkey` - Activate premium keys\n• `/checkinvites` - Check invite progress\n• `/config` - Open config menu", inline=False)
     confirm.set_footer(text="made by Arxqn")
     await interaction.followup.send(embed=confirm, ephemeral=True)
 
@@ -861,7 +998,7 @@ async def gen(interaction: discord.Interaction, stock_type: str):
         role_name = config.get("free_gen_role_name", "free gen")
         role = discord.utils.get(interaction.user.roles, name=role_name)
         if not role and not is_admin(interaction):
-            await interaction.response.send_message(f"❌ Need `{role_name}` role. Use `/getinvite` then `/checkinvites`", ephemeral=True)
+            await interaction.response.send_message(f"❌ Need `{role_name}` role. Invite people to get it!", ephemeral=True)
             return
         
         can, remaining = check_free_cooldown(guild_id, interaction.user.id)
@@ -1045,7 +1182,7 @@ async def checkprem(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ============================================
-# CHECKINVITES COMMAND
+# CHECKINVITES COMMAND (UPDATED)
 # ============================================
 
 @bot.tree.command(name="checkinvites", description="Check your invites")
@@ -1064,30 +1201,50 @@ async def checkinvites(interaction: discord.Interaction):
     reward_hours = config.get("invite_reward_duration", "24")
     role_name = config.get("free_gen_role_name", "free gen")
     role = discord.utils.get(interaction.guild.roles, name=role_name)
+    age_days = config.get("invite_age_required_days", 7)
     
     embed = discord.Embed(title="📊 Your Invites", color=discord.Color.dark_gray())
     
-    if count >= free_role_invites and role and role not in interaction.user.roles:
+    # Check if user meets the free role requirement (only if >0)
+    if free_role_invites > 0 and count >= free_role_invites and role and role not in interaction.user.roles:
         await interaction.user.add_roles(role)
         embed.description = f"🎉 You now have the `{role.name}` role! ({count} invites)\n\n"
     else:
         embed.description = ""
     
-    embed.add_field(name="People Invited", value=f"`{count}`", inline=True)
+    embed.add_field(name="People Invited (Valid)", value=f"`{count}`", inline=True)
+    
+    # Show users they've invited (who are still in server)
+    invited_users_list = []
+    if "user_inviter_map" in invite_data:
+        for joined_user_id, inviter_id in invite_data["user_inviter_map"].items():
+            if inviter_id == uid:
+                joined_member = interaction.guild.get_member(int(joined_user_id))
+                if joined_member:
+                    invited_users_list.append(f"• {joined_member.name}")
+    
+    if invited_users_list:
+        invited_text = "\n".join(invited_users_list[:10])
+        if len(invited_users_list) > 10:
+            invited_text += f"\n... and {len(invited_users_list) - 10} more"
+        embed.add_field(name="✅ Currently in Server", value=invited_text, inline=False)
     
     if role:
         has_role = role in interaction.user.roles
-        embed.add_field(name="Has free gen role", value="✅ Yes" if has_role else f"❌ No ({free_role_invites} invites needed)", inline=True)
+        if free_role_invites == 0:
+            embed.add_field(name="Has Free Gen Role", value="✅ Yes (Auto-granted on join)" if has_role else "❌ No (Contact admin)", inline=True)
+        else:
+            embed.add_field(name="Has Free Gen Role", value="✅ Yes" if has_role else f"❌ No ({free_role_invites} invites needed)", inline=True)
     
     if count >= reward_count and not rewarded:
-        embed.add_field(name="🎁 Reward", value=f"You've reached {reward_count} invites! A {reward_hours}-hour premium key will be sent automatically.", inline=False)
+        embed.add_field(name="🎁 Reward", value=f"You've reached {reward_count} invites! A {reward_hours}-hour premium key will be sent automatically when you reach this milestone.", inline=False)
     elif count >= reward_count and rewarded:
         embed.add_field(name="🎁 Reward", value="✅ Already claimed your premium key!", inline=False)
     else:
         remaining = reward_count - count
-        embed.add_field(name="🎁 Next Reward", value=f"Invite {remaining} more people to get a {reward_hours}-hour premium key!", inline=False)
+        embed.add_field(name="🎁 Next Reward", value=f"Invite {remaining} more **valid** people to get a {reward_hours}-hour premium key!", inline=False)
     
-    embed.add_field(name="📌 Note", value=f"Invited accounts must be **> {config.get('invite_age_required_days', 7)} days old** to count.\nRun `/getinvite` to get your personal invite link!", inline=False)
+    embed.add_field(name="📌 Important Rules", value=f"• Invited accounts must be **> {age_days} days old** to count\n• If an invited user leaves, your invite count decreases\n• You may lose the free gen role if your count drops below {free_role_invites}", inline=False)
     embed.set_footer(text="made by Arxqn")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -1114,7 +1271,11 @@ class NumberModal(discord.ui.Modal, title="Enter Number"):
     async def on_submit(self, interaction: discord.Interaction):
         try:
             value = int(self.number_input.value)
-            if value < 1:
+            if self.setting_name == "free_role_invites_required":
+                if value < 0:
+                    await interaction.response.send_message("❌ Value cannot be negative. Use 0 for auto-grant.", ephemeral=True)
+                    return
+            elif value < 1:
                 await interaction.response.send_message("❌ Value must be greater than 0.", ephemeral=True)
                 return
         except ValueError:
@@ -1290,6 +1451,28 @@ class ConfigView(discord.ui.View):
         modal = NumberModal("default_prem_cooldown", current, self.guild_id)
         await interaction.response.send_modal(modal)
     
+    @discord.ui.button(label="🔄 Auto-Give Role on Join", style=discord.ButtonStyle.success, row=3)
+    async def auto_give_role_toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = get_server_config(self.guild_id)
+        current = config.get("auto_give_free_role_on_join", True)
+        new_value = not current
+        config["auto_give_free_role_on_join"] = new_value
+        server_bot_config[self.guild_id] = config
+        save_server_config(self.guild_id)
+        
+        status = "✅ ENABLED" if new_value else "❌ DISABLED"
+        embed = discord.Embed(
+            title="⚙️ Auto-Give Role Setting",
+            description=f"Auto-give free gen role on join is now **{status}**\n\n*Note: This only takes effect when `Free Role Invites Required` is set to 0*",
+            color=discord.Color.dark_gray()
+        )
+        embed.set_footer(text="made by Arxqn")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+        # Refresh the config menu
+        embed = create_config_embed(self.guild_id)
+        await interaction.edit_original_response(embed=embed, view=self)
+    
     @discord.ui.button(label="🔁 Reset to Defaults", style=discord.ButtonStyle.danger, row=3)
     async def reset_defaults(self, interaction: discord.Interaction, button: discord.ui.Button):
         server_bot_config[self.guild_id] = DEFAULT_CONFIG.copy()
@@ -1301,7 +1484,7 @@ class ConfigView(discord.ui.View):
         embed = create_config_embed(self.guild_id)
         await interaction.edit_original_response(embed=embed, view=self)
     
-    @discord.ui.button(label="❌ Close", style=discord.ButtonStyle.gray, row=3)
+    @discord.ui.button(label="❌ Close", style=discord.ButtonStyle.gray, row=4)
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("Config menu closed.", ephemeral=True)
         self.stop()
@@ -1322,6 +1505,9 @@ def create_config_embed(guild_id):
     embed.add_field(name="⏱️ Reward Duration", value=f"`{config.get('invite_reward_duration', '24')}` hours", inline=True)
     embed.add_field(name="⏱️ Free Cooldown", value=f"`{config.get('default_free_cooldown', 30)}` sec", inline=True)
     embed.add_field(name="⏱️ Prem Cooldown", value=f"`{config.get('default_prem_cooldown', 30)}` sec", inline=True)
+    
+    auto_give = "✅ Yes" if config.get("auto_give_free_role_on_join", True) else "❌ No"
+    embed.add_field(name="🔄 Auto-Give Role on Join", value=f"`{auto_give}`\n*(When invites=0)*", inline=True)
     
     embed.set_footer(text="made by Arxqn")
     return embed
@@ -1362,29 +1548,9 @@ async def setcooldown(interaction: discord.Interaction, stock_type: str, seconds
     else:
         await interaction.followup.send("❌ Use `free` or `prem`", ephemeral=True)
 
-@bot.tree.command(name="getinvite", description="Get personal invite link")
-async def getinvite(interaction: discord.Interaction):
-    try:
-        invite = await interaction.channel.create_invite(max_uses=1, max_age=86400, unique=True)
-        config = get_server_config(str(interaction.guild.id))
-        free_role_invites = config.get("free_role_invites_required", 1)
-        reward_count = config.get("invite_reward_count", 5)
-        reward_hours = config.get("invite_reward_duration", "24")
-        age_days = config.get("invite_age_required_days", 7)
-        embed = discord.Embed(
-            title="🔗 Your Invite Link",
-            description=f"**{invite.url}**\n\n"
-                        f"**Rewards:**\n"
-                        f"• {free_role_invites} invite → free gen role\n"
-                        f"• {reward_count} invites → {reward_hours}-hour premium key\n"
-                        f"Accounts must be >{age_days} days old\n\n"
-                        f"**After inviting someone, run `/checkinvites` to get your role!**",
-            color=discord.Color.dark_gray()
-        )
-        embed.set_footer(text="made by Arxqn")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    except:
-        await interaction.response.send_message("❌ Bot needs Create Invite permission", ephemeral=True)
+# ============================================
+# SETFREE/SETPREM CHANNEL COMMANDS
+# ============================================
 
 @bot.tree.command(name="setfreechannel", description="[ADMIN] Set free gen channel")
 async def setfreechannel(interaction: discord.Interaction, channel: discord.TextChannel):
